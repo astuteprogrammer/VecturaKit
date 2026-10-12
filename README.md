@@ -503,7 +503,7 @@ The embedder:
 
 ### EmbeddingGemma 2 with a local llama.cpp server
 
-`EmbeddingGemma2Embedder` in `VecturaOAIKit` supports text retrieval with explicit **Q8_0 or BF16**
+`EmbeddingGemma2Embedder` in `VecturaOAIKit` supports text indexing and optional image queries with explicit **Q8_0 or BF16**
 GGUF artifact selection and **128/256/512/768** Matryoshka output dimensions. It formats documents
 and queries separately, validates server model aliases, normalizes outputs, and guards default
 persisted databases against embedding-space changes. The caller manages the matching server.
@@ -517,7 +517,10 @@ let vectorDB = try await VecturaKit(
 ```
 
 See [EmbeddingGemma 2 setup, artifact sizes, compatibility and tests](Docs/EMBEDDING_GEMMA_2.md).
-This is text-only version 2 support via a local server; original 300M and in-process MLX are outside this provider.
+To find stored text using an image, enable `enableImageQueries: true`, load the matching projector,
+then pass `try await embedder.embedImageQuery(data: imageBytes, format: .png)` to
+`vectorDB.search(query: .vector(imageVector))`. Only text documents are indexed; query images are not stored.
+Original 300M, media ingestion and in-process MLX are outside this provider.
 
 ## NaturalLanguage Integration
 

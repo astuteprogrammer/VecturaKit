@@ -62,6 +62,15 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
       }
     }
 
+    let body: [String: Any] = ["model": model, "input": texts]
+    return try await embed(
+      requestBody: JSONSerialization.data(withJSONObject: body),
+      expectedCount: texts.count,
+      requireValidIndices: requireValidIndices
+    )
+  }
+
+  func embed(requestBody: Data, expectedCount: Int, requireValidIndices: Bool) async throws -> [[Float]] {
     var request = URLRequest(url: try embeddingsURL())
     request.httpMethod = "POST"
     request.timeoutInterval = timeoutInterval
@@ -70,8 +79,7 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
       request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
     }
 
-    let body: [String: Any] = ["model": model, "input": texts]
-    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    request.httpBody = requestBody
 
     let (data, response) = try await OpenAICompatibleRateLimitRetry.data(
       for: request,
@@ -105,8 +113,8 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
       }
       struct IndexedItem: Decodable { let index: Int }
       guard let indexed = try? JSONDecoder().decode(IndexedResponse.self, from: data),
-        indexed.data.count == texts.count,
-        Set(indexed.data.map(\.index)) == Set(texts.indices)
+        indexed.data.count == expectedCount,
+        Set(indexed.data.map(\.index)) == Set(0..<expectedCount)
       else {
         throw OpenAICompatibleEmbedderError.invalidInput("Response must contain each input index exactly once")
       }
@@ -121,8 +129,8 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
         return embedding.map(\.floatValue)
       }
 
-    guard embeddings.count == texts.count else {
-      throw OpenAICompatibleEmbedderError.vectorCountMismatch(expected: texts.count, received: embeddings.count)
+    guard embeddings.count == expectedCount else {
+      throw OpenAICompatibleEmbedderError.vectorCountMismatch(expected: expectedCount, received: embeddings.count)
     }
 
     if let dimension = embeddings.first?.count {

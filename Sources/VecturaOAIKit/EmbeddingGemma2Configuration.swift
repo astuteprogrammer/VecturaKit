@@ -1,6 +1,6 @@
 import Foundation
 
-/// Text-only GGUF configuration for EmbeddingGemma 2 through a separately managed llama-server.
+/// Text-index GGUF configuration for EmbeddingGemma 2 through a separately managed llama-server.
 /// This does not download weights, start a server, or quantize a model at runtime.
 public struct EmbeddingGemma2Configuration: Sendable, Equatable {
   /// Published text-weight artifacts. BF16 is full precision, Q8_0 is quantized.
@@ -25,6 +25,27 @@ public struct EmbeddingGemma2Configuration: Sendable, Equatable {
       }
     }
 
+    public var projectorFilename: String { "mmproj-" + filename }
+
+    /// Additional published projector bytes for image queries (contains vision and audio encoders).
+    public var projectorSizeBytes: Int {
+      switch self {
+      case .q8Zero: 554_821_024
+      case .bf16: 982_074_784
+      }
+    }
+
+    public var projectorSHA256: String {
+      switch self {
+      case .q8Zero: "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"
+      case .bf16: "d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766"
+      }
+    }
+
+    public var projectorDownloadURL: URL {
+      downloadURL.deletingLastPathComponent().appendingPathComponent(projectorFilename)
+    }
+
     /// Pinned public upstream artifact. Verify the checksum before starting the server.
     public var downloadURL: URL {
       URL(string: "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/"
@@ -44,14 +65,22 @@ public struct EmbeddingGemma2Configuration: Sendable, Equatable {
   public let precision: Precision
   public let dimensions: Dimensions
   public let batchSize: Int
+  /// Enables image query embedding; the caller must load the matching projector.
+  public let enableImageQueries: Bool
 
-  public init(precision: Precision = .q8Zero, dimensions: Dimensions = .d768, batchSize: Int = 8) throws {
+  public init(
+    precision: Precision = .q8Zero,
+    dimensions: Dimensions = .d768,
+    batchSize: Int = 8,
+    enableImageQueries: Bool = false
+  ) throws {
     guard (1...32).contains(batchSize) else {
       throw OpenAICompatibleEmbedderError.invalidInput("Batch size must be between 1 and 32")
     }
     self.precision = precision
     self.dimensions = dimensions
     self.batchSize = batchSize
+    self.enableImageQueries = enableImageQueries
   }
 
   /// Pass this alias to llama-server; the provider checks `/v1/models` before every embedding batch.
@@ -65,7 +94,7 @@ public struct EmbeddingGemma2Configuration: Sendable, Equatable {
   /// Arguments are separate strings; pass directly to Process.arguments, without a shell.
   /// Configure a larger context/batch only after checking memory headroom.
   public func llamaServerArguments(modelDirectory: URL, port: UInt16 = 8080) -> [String] {
-    [
+    var arguments = [
       "--model", modelDirectory.appendingPathComponent(precision.filename).path,
       "--alias", modelAlias,
       "--embedding", "--pooling", "mean",
@@ -73,5 +102,9 @@ public struct EmbeddingGemma2Configuration: Sendable, Equatable {
       "--parallel", "1", "--threads", "4", "--n-gpu-layers", "99",
       "--host", "127.0.0.1", "--port", String(port), "--no-webui"
     ]
+    if enableImageQueries {
+      arguments += ["--mmproj", modelDirectory.appendingPathComponent(precision.projectorFilename).path]
+    }
+    return arguments
   }
 }

@@ -21,6 +21,111 @@ struct EmbeddingGemma2EmbedderTests {
     #expect(EmbeddingGemma2Configuration.Precision(rawValue: "Q4_0") == nil)
   }
 
+  @Test("Image queries opt into a verified projector without changing the text embedding identity")
+  func imageConfiguration() throws {
+    for precision in EmbeddingGemma2Configuration.Precision.allCases {
+      let text = try EmbeddingGemma2Configuration(precision: precision)
+      let images = try EmbeddingGemma2Configuration(precision: precision, enableImageQueries: true)
+      #expect(text.embeddingSpaceIdentifier == images.embeddingSpaceIdentifier)
+      #expect(!text.llamaServerArguments(modelDirectory: URL(filePath: "/tmp")).contains("--mmproj"))
+      let arguments = images.llamaServerArguments(modelDirectory: URL(filePath: "/tmp"))
+      #expect(arguments.suffix(2) == ["--mmproj", "/tmp/" + precision.projectorFilename])
+      #expect(precision.projectorSHA256.count == 64)
+      #expect(precision.projectorSizeBytes == (precision == .q8Zero ? 554_821_024 : 982_074_784))
+      #expect(precision.projectorDownloadURL.lastPathComponent == precision.projectorFilename)
+    }
+  }
+
+  @Test("Image input uses nested media content without a text prompt", arguments: [true, false])
+  func imageRequestShape(_ png: Bool) async throws {
+    let config = try EmbeddingGemma2Configuration(dimensions: .d256, enableImageQueries: true)
+    let bytes = Data(png ? [137, 80, 78, 71, 13, 10, 26, 10, 1] : [255, 216, 255, 1])
+    let format: EmbeddingGemma2Embedder.ImageFormat = png ? .png : .jpeg
+    let session = makeSession(config: config) { request in
+      let body = try #require(requestBody(request))
+      let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+      let inputs = try #require(json["input"] as? [[String: Any]])
+      #expect(inputs.count == 1)
+      let content = try #require(inputs[0]["content"] as? [[String: Any]])
+      #expect(content.count == 1)
+      #expect(content[0]["type"] as? String == "image_url")
+      let image = try #require(content[0]["image_url"] as? [String: String])
+      #expect(image["url"] == "data:" + format.rawValue + ";base64," + bytes.base64EncodedString())
+      return try response(request, vectors: [(0, Array(repeating: 1, count: 768))])
+    }
+    defer { session.invalidateAndCancel(); GemmaURLProtocol.handler.set(nil) }
+    let embedder = try EmbeddingGemma2Embedder(configuration: config, session: session)
+    let vector = try await embedder.embedImageQuery(data: bytes, format: format)
+    #expect(vector.count == 256)
+    #expect(abs(vector.reduce(0) { $0 + $1 * $1 } - 1) < 0.00001)
+  }
+
+  @Test("Disabled, empty, wrong-format and oversized images fail before HTTP")
+  func invalidImages() async throws {
+    let disabled = try EmbeddingGemma2Embedder(configuration: .init(), baseURL: "http://127.0.0.1:1/v1")
+    let signature = Data([137, 80, 78, 71, 13, 10, 26, 10])
+    await #expect(throws: OpenAICompatibleEmbedderError.self) {
+      try await disabled.embedImageQuery(data: signature, format: .png)
+    }
+    let enabled = try EmbeddingGemma2Embedder(
+      configuration: .init(enableImageQueries: true), baseURL: "http://127.0.0.1:1/v1"
+    )
+    for bytes in [Data(), Data("caption".utf8), Data(repeating: 0, count: 10 * 1024 * 1024 + 1)] {
+      await #expect(throws: OpenAICompatibleEmbedderError.self) {
+        try await enabled.embedImageQuery(data: bytes, format: .png)
+      }
+    }
+    await #expect(throws: OpenAICompatibleEmbedderError.self) {
+      try await enabled.embedImageQuery(data: signature, format: .jpeg)
+    }
+  }
+
+  @Test("Image queries reject a text-only server before uploading bytes")
+  func imageCapabilityRequired() async throws {
+    let config = try EmbeddingGemma2Configuration(enableImageQueries: true)
+    let session = makeSession(config: config, imageCapable: false) { _ in
+      Issue.record("A text-only server must not receive image bytes")
+      throw URLError(.badServerResponse)
+    }
+    defer { session.invalidateAndCancel(); GemmaURLProtocol.handler.set(nil) }
+    let embedder = try EmbeddingGemma2Embedder(configuration: config, session: session)
+    await #expect(throws: OpenAICompatibleEmbedderError.self) {
+      try await embedder.embedImageQuery(data: Data([255, 216, 255]), format: .jpeg)
+    }
+  }
+
+  @Test("Image queries propagate server errors and reject malformed vectors", arguments: [0, 1, 2])
+  func imageFailures(_ fixture: Int) async throws {
+    let config = try EmbeddingGemma2Configuration(enableImageQueries: true)
+    let session = makeSession(config: config) { request in
+      if fixture == 0 { return (try httpResponse(request, status: 400), Data("Invalid image".utf8)) }
+      return try response(request, vectors: [(0, Array(repeating: 0, count: fixture == 1 ? 767 : 768))])
+    }
+    defer { session.invalidateAndCancel(); GemmaURLProtocol.handler.set(nil) }
+    let embedder = try EmbeddingGemma2Embedder(configuration: config, session: session)
+    await #expect(throws: (any Error).self) {
+      try await embedder.embedImageQuery(data: Data([255, 216, 255]), format: .jpeg)
+    }
+  }
+
+  @Test("Cancellation during an image request returns no vector")
+  func imageCancellation() async throws {
+    let config = try EmbeddingGemma2Configuration(enableImageQueries: true)
+    let started = GemmaCalls()
+    let session = makeSession(config: config) { request in
+      started.append(["started"])
+      try await Task.sleep(for: .seconds(30))
+      return try response(request, vectors: [(0, Array(repeating: 1, count: 768))])
+    }
+    defer { session.invalidateAndCancel(); GemmaURLProtocol.handler.set(nil) }
+    let embedder = try EmbeddingGemma2Embedder(configuration: config, session: session)
+    let task = Task { try await embedder.embedImageQuery(data: Data([255, 216, 255]), format: .jpeg) }
+    for _ in 0..<100 where started.values.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+    #expect(!started.values.isEmpty)
+    task.cancel()
+    await #expect(throws: (any Error).self) { try await task.value }
+  }
+
   @Test("Invalid configuration fails before any HTTP request")
   func invalidConfiguration() throws {
     for size in [-1, 0, 33, Int.max] {
@@ -265,11 +370,14 @@ private final class GemmaCalls: @unchecked Sendable {
 }
 
 private func makeSession(
-  config: EmbeddingGemma2Configuration, embeddings: @escaping GemmaHandler
+  config: EmbeddingGemma2Configuration, imageCapable: Bool? = nil, embeddings: @escaping GemmaHandler
 ) -> URLSession {
   GemmaURLProtocol.handler.set { request in
     if request.url?.lastPathComponent == "models" {
-      let data = try JSONSerialization.data(withJSONObject: ["data": [["id": config.modelAlias]]])
+      let modalities = (imageCapable ?? config.enableImageQueries) ? ["text", "image"] : ["text"]
+      let data = try JSONSerialization.data(withJSONObject: ["data": [[
+        "id": config.modelAlias, "architecture": ["input_modalities": modalities]
+      ]]])
       return (try httpResponse(request), data)
     }
     #expect(request.value(forHTTPHeaderField: "Authorization") == nil)

@@ -1,7 +1,7 @@
 import Foundation
 import VecturaKit
 
-/// EmbeddingGemma 2 text retrieval using a caller-owned llama.cpp OpenAI-compatible server.
+/// EmbeddingGemma 2 text indexing and text/image retrieval using a caller-owned llama.cpp OpenAI-compatible server.
 /// The server owns GGUF tokenization, special tokens, mean pooling and the learned projection.
 /// `embed(text:)` and `embed(texts:)` embed documents; `embedQuery(text:)` embeds search queries.
 public actor EmbeddingGemma2Embedder: VecturaEmbedder {
@@ -55,6 +55,42 @@ public actor EmbeddingGemma2Embedder: VecturaEmbedder {
     return vectors[0]
   }
 
+  /// Image formats supported by the image-query adapter.
+  public enum ImageFormat: String, Sendable {
+    case jpeg = "image/jpeg"
+    case png = "image/png"
+  }
+
+  /// Embeds image bytes for `database.search(query: .vector(imageVector))` against stored text.
+  /// Images are not saved or indexed. Input is limited to 10 MiB; the server validates image decoding.
+  /// Requires `enableImageQueries` and a server advertising image input with the matching projector.
+  public func embedImageQuery(data: Data, format: ImageFormat) async throws -> [Float] {
+    try Task.checkCancellation()
+    guard configuration.enableImageQueries else {
+      throw OpenAICompatibleEmbedderError.invalidInput("Image queries must be explicitly enabled")
+    }
+    guard !data.isEmpty, data.count <= 10 * 1024 * 1024 else {
+      throw OpenAICompatibleEmbedderError.invalidInput("Image data must be nonempty JPEG or PNG bytes, at most 10 MiB")
+    }
+    let signature: [UInt8] = format == .png ? [137, 80, 78, 71, 13, 10, 26, 10] : [255, 216, 255]
+    guard data.starts(with: signature) else {
+      throw OpenAICompatibleEmbedderError.invalidInput("Image bytes do not match the specified format")
+    }
+    try await validateServerModel(requiringImage: true)
+    let body: [String: Any] = [
+      "model": configuration.modelAlias,
+      "input": [["content": [[
+        "type": "image_url",
+        "image_url": ["url": "data:\(format.rawValue);base64," + data.base64EncodedString()]
+      ]]]]
+    ]
+    let vectors = try await backend.embed(
+      requestBody: JSONSerialization.data(withJSONObject: body), expectedCount: 1, requireValidIndices: true
+    )
+    try Task.checkCancellation()
+    return try normalize(vectors[0])
+  }
+
   private func validate(_ texts: [String]) throws {
     try Task.checkCancellation()
     guard !texts.isEmpty, texts.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
@@ -75,7 +111,7 @@ public actor EmbeddingGemma2Embedder: VecturaEmbedder {
     return result
   }
 
-  private func validateServerModel() async throws {
+  private func validateServerModel(requiringImage: Bool = false) async throws {
     var request = URLRequest(url: modelsURL)
     request.timeoutInterval = timeoutInterval
     let (data, response) = try await session.data(for: request)
@@ -85,14 +121,25 @@ public actor EmbeddingGemma2Embedder: VecturaEmbedder {
         message: "Unable to verify llama-server model"
       )
     }
-    let models = try JSONDecoder().decode(ServerModelList.self, from: data)
-    guard models.data.contains(where: { $0.id == configuration.modelAlias }) else {
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let models = try decoder.decode(ServerModelList.self, from: data)
+    guard let model = models.data.first(where: { $0.id == configuration.modelAlias }) else {
       throw OpenAICompatibleEmbedderError.invalidInput("Server must load the selected GGUF with the configured alias")
+    }
+    if requiringImage, model.architecture?.inputModalities.contains("image") != true {
+      throw OpenAICompatibleEmbedderError.invalidInput("Server must advertise image input; load the matching projector")
     }
   }
 
   private struct ServerModelList: Decodable { let data: [ServerModel] }
-  private struct ServerModel: Decodable { let id: String }
+  private struct ServerModel: Decodable {
+    let id: String
+    let architecture: ServerArchitecture?
+  }
+  private struct ServerArchitecture: Decodable {
+    let inputModalities: [String]
+  }
 
   private func normalize(_ vector: [Float]) throws -> [Float] {
     guard vector.count == 768 else {
