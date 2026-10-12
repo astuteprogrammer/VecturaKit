@@ -46,6 +46,10 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
   }
 
   public func embed(texts: [String]) async throws -> [[Float]] {
+    try await embed(texts: texts, requireValidIndices: false)
+  }
+
+  func embed(texts: [String], requireValidIndices: Bool) async throws -> [[Float]] {
     guard !texts.isEmpty else {
       throw OpenAICompatibleEmbedderError.invalidInput("Cannot embed empty array of texts")
     }
@@ -92,6 +96,13 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
       let dataArray = json["data"] as? [[String: Any]]
     else {
       throw OpenAICompatibleEmbedderError.httpError(statusCode: 0, message: "Invalid response format")
+    }
+
+    if requireValidIndices {
+      let indices = dataArray.compactMap { $0["index"] as? Int }
+      guard indices.count == texts.count, Set(indices) == Set(texts.indices) else {
+        throw OpenAICompatibleEmbedderError.invalidInput("Response must contain each input index exactly once")
+      }
     }
 
     let embeddings = dataArray
