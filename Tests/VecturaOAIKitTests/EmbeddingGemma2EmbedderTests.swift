@@ -108,12 +108,20 @@ struct EmbeddingGemma2EmbedderTests {
     await #expect(throws: (any Error).self) { try await embedder.embed(text: "document") }
   }
 
-  @Test("Rejects missing, duplicate and out-of-range response indices", arguments: [0, 1, 2, 3])
+  @Test("Rejects missing, duplicate and out-of-range response indices", arguments: [0, 1, 2, 3, 4, 5, 6])
   func invalidIndices(_ fixture: Int) async throws {
     let config = try EmbeddingGemma2Configuration()
     let session = makeSession(config: config) { request in
       let vector = [Double](repeating: 1, count: 768)
       let pairs = fixture == 0 ? [(0, vector)] : [(0, vector), (fixture == 1 ? 0 : 2, vector)]
+      if fixture >= 4 {
+        var items: [[String: Any]] = [["index": 0, "embedding": vector], ["index": 1, "embedding": vector]]
+        if fixture == 4 { items.append(["ignored": true]) }
+        if fixture == 5 { items[1]["index"] = true }
+        if fixture == 6 { items[1]["index"] = 1.5 }
+        let data = try JSONSerialization.data(withJSONObject: ["data": items])
+        return (try httpResponse(request), data)
+      }
       if fixture == 3 {
         let data = try JSONSerialization.data(withJSONObject: ["data": [["embedding": vector]]])
         return (try httpResponse(request), data)

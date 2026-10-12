@@ -99,8 +99,15 @@ public actor OpenAICompatibleEmbedder: VecturaEmbedder {
     }
 
     if requireValidIndices {
-      let indices = dataArray.compactMap { $0["index"] as? Int }
-      guard indices.count == texts.count, Set(indices) == Set(texts.indices) else {
+      // JSONDecoder rejects booleans/fractional values that NSNumber bridging may coerce to Int.
+      struct IndexedResponse: Decodable {
+        let data: [IndexedItem]
+      }
+      struct IndexedItem: Decodable { let index: Int }
+      guard let indexed = try? JSONDecoder().decode(IndexedResponse.self, from: data),
+        indexed.data.count == texts.count,
+        Set(indexed.data.map(\.index)) == Set(texts.indices)
+      else {
         throw OpenAICompatibleEmbedderError.invalidInput("Response must contain each input index exactly once")
       }
     }
